@@ -1,0 +1,195 @@
+name: "Auto-Commit-Squash-Merge"
+description: >
+  Commits and pushes changes to a temporary branch, opens a pull request,
+  retries squash-merge with fixed and random backoff, then deletes the branch.
+  Generic version usable on any repository.
+
+author: "Affinity7 Consulting Ltd"
+branding:
+  icon: git-merge
+  color: blue
+
+inputs:
+  token:
+    description: "GitHub App or PAT token used for commits and PRs"
+    required: true
+  repo_owner:
+    description: "Owner or organization of the target repository"
+    required: true
+  repo_name:
+    description: "Name of the target repository"
+    required: true
+  namespace:
+    description: "Optional contextual label (e.g., environment or namespace)"
+    required: true
+  cluster:
+    description: "Optional contextual label (e.g., cluster or system name)"
+    required: true
+  app_name:
+    description: "Application or logical name for commit message"
+    required: true
+  repo_path_rel:
+    description: "Relative path to the files being committed"
+    required: true
+  delete_only:
+    description: "If true, performs delete-only commit and merge path"
+    required: false
+    default: "false"
+
+outputs:
+  branch:
+    description: "Temporary branch created by this action"
+    value: ${{ steps.commit_deploy.outputs.branch }}
+
+runs:
+  using: "composite"
+  steps:
+
+    - name: Commit and push to temp branch
+      id: commit_deploy
+      if: ${{ inputs.delete_only == 'false' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd continuous-deployment
+
+        echo "🔎 Debug: Current working directory = $(pwd)"
+        git remote -v
+
+        git config user.name "auto-commit-squash-merge"
+        git config user.email "actions@github.com"
+
+        echo "🔎 Debug: Adding files from: ${{ inputs.repo_path_rel }}/"
+        ls -la "${{ inputs.repo_path_rel }}/" || echo "⚠️ Directory not found"
+
+        git add -A "${{ inputs.repo_path_rel }}/"
+
+        echo "🔎 Debug: Status after staging:"
+        git status --short || true
+        git diff --cached --stat || true
+
+        if git diff --cached --quiet; then
+          echo "⚠️ No changes detected — creating empty commit"
+          git commit --allow-empty -m "No-op commit for ${{ inputs.app_name }} at $(date -u)"
+        else
+          git commit -m "Deploy to ${{ inputs.cluster }}/${{ inputs.namespace }} for ${{ inputs.app_name }}"
+        fi
+
+        branch="deploy-${{ inputs.cluster }}-${{ inputs.namespace }}-${{ inputs.app_name }}-$(date +%s)"
+        echo "🔎 Debug: Branch to push = $branch"
+
+        git log -1 --oneline
+
+        git push --verbose origin HEAD:"$branch" || { echo "❌ git push failed"; exit 1; }
+
+        git ls-remote origin "refs/heads/$branch" || echo "⚠️ Branch not found on remote"
+
+        echo "branch=$branch" >> "$GITHUB_OUTPUT"
+      env:
+        GIT_TOKEN: ${{ inputs.token }}
+
+    - name: Simple retrying API-based squash merge
+      if: ${{ inputs.delete_only == 'false' }}
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const owner = process.env.REPO_OWNER;
+          const repo = process.env.REPO_NAME;
+          const branch = process.env.BRANCH;
+          const appName = process.env.APP_NAME;
+
+          async function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+          const fixedRetries = 10;   // 2s interval
+          const randomRetries = 20;  // 1–7.5s randomized
+          const maxRetries = fixedRetries + randomRetries;
+          let prNumber = null;
+          let merged = false;
+
+          try {
+            // --- Detect base branch ---
+            const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
+            const baseBranch = repoInfo.default_branch;
+            core.info(`ℹ️ Default branch = ${baseBranch}`);
+
+            // --- Create PR ---
+            const { data: pr } = await github.rest.pulls.create({
+              owner,
+              repo,
+              head: branch,
+              base: baseBranch,
+              title: `Deploy ${appName} to ${process.env.CLUSTER}/${process.env.NAMESPACE}`,
+              body: "Automated commit and squash-merge update."
+            });
+            prNumber = pr.number;
+            core.info(`✅ Opened PR #${pr.number}`);
+
+            // --- Attempt merge loop ---
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+              try {
+                await github.rest.pulls.merge({
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  merge_method: "squash"
+                });
+                core.info(`✅ Squash-merged PR #${pr.number} on attempt ${attempt}`);
+                merged = true;
+                break;
+              } catch (err) {
+                const msg = err.message || "";
+                core.warning(`⚠️ Merge attempt ${attempt} failed: ${msg}`);
+
+                // Hard conflict — same-file edits — fail immediately
+                if (/conflict|cannot.*merge.*due to conflicts/i.test(msg)) {
+                  core.setFailed(`❌ Real merge conflict detected for PR #${pr.number}.`);
+                  break;
+                }
+
+                // Otherwise, retry (transient base-modified/unknown state)
+                if (attempt <= fixedRetries) {
+                  await wait(2000); // first 10 tries = fixed 2s
+                } else {
+                  const delay = 1000 + Math.random() * 6500; // 1–7.5s
+                  core.info(`⏳ Retrying in ${(delay / 1000).toFixed(1)}s...`);
+                  await wait(delay);
+                }
+              }
+            }
+
+            if (!merged) {
+              core.setFailed(`❌ Could not squash-merge PR #${pr.number} after ${maxRetries} attempts.`);
+            }
+
+          } catch (err) {
+            core.setFailed(`❌ Error during PR merge process: ${err.message || err}`);
+          } finally {
+            // --- Always cleanup ---
+            if (prNumber) {
+              if (!merged) {
+                core.info(`🧹 Cleanup: leaving PR #${prNumber} open as it failed and deleting branch '${branch}'...`);
+              }
+              // --- Guard protected branches from deletion ---
+              const protectedBranches = ["main", "master"];
+              if (protectedBranches.includes(branch)) {
+                core.warning(`🚫 Skipping deletion of protected branch '${branch}'.`);
+              } else {
+                try {
+                  await github.rest.git.deleteRef({
+                    owner, repo, ref: `heads/${branch}`
+                  });
+                  core.info(`🗑️ Deleted branch '${branch}'.`);
+                } catch (e) {
+                  core.warning(`⚠️ Could not delete branch '${branch}': ${e.message}`);
+                }
+              }
+            }
+          }
+      env:
+        REPO_OWNER: ${{ inputs.repo_owner }}
+        REPO_NAME: ${{ inputs.repo_name }}
+        BRANCH: ${{ steps.commit_deploy.outputs.branch }}
+        CLUSTER: ${{ inputs.cluster }}
+        NAMESPACE: ${{ inputs.namespace }}
+        APP_NAME: ${{ inputs.app_name }}
