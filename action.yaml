@@ -49,7 +49,7 @@ inputs:
     description: "If true, performs delete-only commit and merge path"
     required: false
     default: false
-    type: boolean
+    type: string
 
 
 outputs:
@@ -63,7 +63,7 @@ runs:
 
     - name: Commit and push to temp branch
       id: commit_deploy
-      if: ${{ inputs.delete_only == false }}
+      if: ${{ inputs.delete_only == 'false' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -105,7 +105,7 @@ runs:
         GIT_TOKEN: ${{ inputs.token }}
 
     - name: Simple retrying API-based squash merge
-      if: ${{ inputs.delete_only == false }}
+      if: ${{ inputs.delete_only == 'false' }}
       uses: actions/github-script@v7
       with:
         github-token: ${{ inputs.token }}
