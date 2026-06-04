@@ -106,7 +106,7 @@ runs:
 
     - name: Simple retrying API-based squash merge
       if: ${{ inputs.delete_only == 'false' }}
-      uses: actions/github-script@v7
+      uses: actions/github-script@v9
       with:
         github-token: ${{ inputs.token }}
         script: |
